@@ -1,0 +1,750 @@
+#!/usr/bin/env python3
+import errno
+import logging
+import itertools
+import json
+import optparse
+import os
+import socket
+import subprocess
+import sys
+
+from typing import NewType, Optional, Tuple, List, Dict, Callable, Any
+
+DEV_NULL = open(os.devnull)
+DRY_RUN = False
+VERBOSE = False
+
+class Sentinel(object):
+	def __init__(self, desc):
+		self.desc = desc
+	def __str__(self): return 'Sentinel(%s)' % (self.desc,)
+
+RUN_ANYWAY = Sentinel('RUN_ANYWAY')
+
+Sha = NewType('Sha', str)
+Ref = NewType('Ref', str)
+Branch = NewType('Branch', str)
+BaseBranch = NewType('BaseBranch', Branch)
+WipBranch = NewType('WipBranch', Branch)
+Owner = NewType('Owner', str)
+Remote = NewType('Remote', str)
+Commitish = NewType('Commitish', str)
+
+# string manipulation functions
+WIP_PREFIX = 'wip/'
+BRANCH_PREFIX = 'refs/heads/'
+REMOTE_PREFIX = 'refs/remotes/'
+WIP_REF_PREFIX = BRANCH_PREFIX + WIP_PREFIX
+HEAD = 'HEAD'
+MERGE = 'MERGE'
+SPECIAL_OWNERS=set([HEAD,MERGE])
+
+def _make_wip_branch(base: BaseBranch, id: str) -> WipBranch:
+	return WipBranch(Branch(WIP_PREFIX + base + '/' + id))
+
+def my_wip_branch(conf, base: BaseBranch) -> WipBranch:
+	return _make_wip_branch(base, conf.id)
+
+def canonical_wip_branch(base: BaseBranch) -> WipBranch:
+	return _make_wip_branch(base, HEAD)
+
+def merge_wip_branch(base: BaseBranch) -> WipBranch:
+	return _make_wip_branch(base, MERGE)
+
+def ref_of_branch(branch: Branch) -> Ref:
+	return Ref(BRANCH_PREFIX + branch)
+
+def remove_leading(prefix, s):
+	assert s.startswith(prefix)
+	return s[len(prefix):]
+
+def remove_trailing(suffix, s):
+	assert s.endswith(suffix)
+	return s[:-len(suffix)]
+
+def branch_of_ref(ref: Ref) -> Optional[Branch]:
+	if ref is not None and ref.startswith(BRANCH_PREFIX):
+		return Branch(remove_leading(BRANCH_PREFIX, ref))
+	return None
+
+def base_branch_of_wip_branch(branch: WipBranch) -> BaseBranch:
+	return Wip.parse(branch).base
+
+def commitish_of_branch(branch: Branch) -> Commitish:
+	return Commitish(branch)
+
+def commitish_of_ref(ref: Ref) -> Commitish:
+	return Commitish(ref)
+
+def commitish_of_sha(sha: Sha) -> Commitish:
+	return Commitish(sha)
+
+## data model
+
+class Wip(object):
+	base: BaseBranch
+	owner: Owner
+	id: str
+
+	@classmethod
+	def parse(cls, branch: WipBranch) -> 'Wip':
+		base_and_owner = remove_leading(WIP_PREFIX, branch)
+		base, owner = base_and_owner.rsplit('/', 1)
+		return Wip(BaseBranch(base), owner)
+
+	def __init__(self, base: BaseBranch, owner: str) -> None:
+		self.base = base
+		self.id = owner
+		if owner in SPECIAL_OWNERS:
+			self.owner = None
+		else:
+			self.owner = Owner(owner)
+
+	@property
+	def branch(self) -> WipBranch:
+		return assert_wip_branch(Branch(self.base + '/' + self.id))
+
+	@property
+	def is_merge(self) -> bool: return self.id == MERGE
+
+	@property
+	def is_head(self) -> bool: return self.id == HEAD
+
+class WipRef(object):
+	ref: Ref
+	wip: Wip
+	sha: Sha
+
+	@staticmethod
+	def parse(ref: Ref, sha: Sha):
+		is_remote = ref.startswith(REMOTE_PREFIX)
+		if is_remote:
+			remote, branch = RemoteWipRef.split(ref)
+			return RemoteWipRef(ref=ref, remote=remote, wip=Wip.parse(branch), sha=sha)
+		else:
+			branch = assert_wip_branch(branch_of_ref(ref))
+			return LocalWipRef(ref=ref, wip=Wip.parse(branch), sha=sha)
+	
+	@classmethod
+	def try_parse(cls, ref: Ref, sha: Sha):
+		if is_wip_ref(ref) or is_remote_wip_ref(ref):
+			return cls.parse(ref, sha)
+		return None
+
+	@property
+	def is_local(self): return not self.is_remote
+
+	def __eq__(self, other):
+		return type(self) == type(other) and self.ref == other.ref and self.sha == other.sha
+
+class RemoteWipRef(WipRef):
+	ref: Ref
+	remote: Remote
+
+	def __init__(self, ref: Ref, remote: Remote, wip: Wip, sha: Sha) -> None:
+		self.ref = ref
+		self.remote = remote
+		self.wip = wip
+		self.sha = sha
+
+	@property
+	def is_remote(self): return True
+
+	@staticmethod
+	def split(ref: Ref) -> Tuple[Remote, WipBranch]:
+		remote_and_branch = remove_leading(REMOTE_PREFIX, ref)
+		remote, branch = remote_and_branch.split('/',1)
+		return (Remote(remote), assert_wip_branch(Branch(branch)))
+
+class LocalWipRef(WipRef):
+	def __init__(self, ref: Ref, wip: Wip, sha: Sha) -> None:
+		self.ref = ref
+		self.wip = wip
+		self.sha = sha
+	
+	@property
+	def is_remote(self): return False
+
+class RefFilter(object):
+	@staticmethod
+	def mine(conf: MachineConfig, refs: Iterable[WipRef]) -> List[WipRef]:
+		return list(filter(lambda ref: ref.wip.owner == conf.id))
+
+	@staticmethod
+	def merges(refs: Iterable[WipRef]) -> List[WipRef]:
+		return list(filter(lambda ref: ref.wip.is_merge))
+
+	@staticmethod
+	def heads(refs: Iterable[WipRef]) -> List[WipRef]:
+		return list(filter(lambda ref: ref.wip.is_head))
+
+	@staticmethod
+	def for_base(base: BaseBranch, refs: Iterable[WipRef]) -> List[WipRef]:
+		return list(filter(lambda ref: ref.wip.base == base))
+
+	@staticmethod
+	def local(refs: Iterable[WipRef]) -> List[LocalWipRef]:
+		return list(filter(lambda ref: isinstance(ref, LocalWipRef)))
+
+	@staticmethod
+	def remote(refs: Iterable[WipRef]) -> List[RemoteWipRef]:
+		return list(filter(lambda ref: isinstance(ref, RemoteWipRef)))
+
+def is_wip_ref(ref: Ref):
+	return ref.startswith(WIP_REF_PREFIX)
+
+def is_remote_wip_ref(ref: Ref):
+	if ref.startswith(REMOTE_PREFIX):
+		branch: WipBranch
+		remote, branch = RemoteWipRef.split(ref)
+		return branch.startswith(WIP_PREFIX)
+	return False
+
+class PushSpec(object):
+	def __init__(self, src: Ref, dest: Ref, force: bool):
+		self.src = src
+		self.dest = dest
+		self.force = force
+	
+	@property
+	def spec(self):
+		return "%s:%s" % (self.src, self.dest)
+
+	@classmethod
+	def track(cls, local: Ref, force = False) -> 'PushSpec':
+		return cls(local, local)
+
+	@classmethod
+	def delete(cls, local: Ref) -> 'PushSpec':
+		return cls(Ref(''), local, force=False)
+
+## machine config
+
+class MachineConfig(object):
+	def __init__(self, conf=None):
+		logging.debug('Loaded machine config: %r' % (conf,))
+		self.conf = conf
+	
+	def get(self, name, dfl):
+		if self.conf is not None:
+			try:
+				return self.conf[name]
+			except KeyError:
+				pass
+		return dfl
+
+	@property
+	def id(self) -> Owner:
+		id = self.get('id', None)
+		if id is None:
+			id = socket.gethostname()
+		assert bool(id)
+		return Owner(id)
+
+	def remote(self, opts) -> Remote:
+		if opts.remote is not None:
+			return opts.remote
+		configured_remotes : List[Remote] = list(map(Remote, self.get('remotes', [])))
+		available = available_remotes()
+		for configured in configured_remotes:
+			if configured in available:
+				return configured
+		if not available:
+			die("No remotes configured")
+		return available[0]
+
+	@classmethod
+	def load(cls) -> 'MachineConfig':
+		config_dir = os.environ.get('XDG_CONFIG_HOME')
+		if config_dir is None:
+			config_dir = os.path.expanduser('~/.config')
+		config_path = os.path.join(config_dir, 'git-wip')
+		try:
+			with open(config_path) as f:
+				return MachineConfig(json.load(f))
+		except OSError as e:
+			if e.errno == errno.ENOENT:
+				pass
+		return MachineConfig()
+
+# command runners
+
+def log_cmd(cmd):
+	logging.debug('+ ' + ' '.join(cmd))
+
+def run(cmd, dry=None) -> None:
+	log_cmd(cmd)
+	if DRY_RUN and dry is not RUN_ANYWAY:
+		return None
+	else:
+		subprocess.check_call(cmd)
+
+def run_output(cmd, dry) -> str:
+	log_cmd(cmd)
+	if DRY_RUN and dry is not RUN_ANYWAY:
+		return dry
+	return subprocess.check_output(cmd).decode('utf-8').rstrip()
+
+def try_run(cmd, dry) -> bool:
+	log_cmd(cmd)
+	if DRY_RUN and dry is not RUN_ANYWAY:
+		result = dry
+	else:
+		p = subprocess.Popen(cmd)
+		p.wait()
+		result = p.returncode == 0
+	logging.debug(' => %s' % (result,))
+	return result
+
+def try_run_output(cmd, dry) -> str:
+	try:
+		return run_output(cmd, dry=dry)
+	except subprocess.CalledProcessError as e:
+		return None
+
+## pure functions
+
+def is_dirty() -> bool:
+	return not try_run(['git', 'diff-index', '--quiet', 'HEAD', '--'], dry=RUN_ANYWAY)
+
+def is_wip_branch(branch: Optional[Branch]) -> bool:
+	if branch is None:
+		return False
+
+	return branch.startswith(WIP_PREFIX)
+
+def assert_my_wip_branch(conf: MachineConfig, branch: Branch) -> Wip:
+	wip_branch = assert_wip_branch(branch)
+	wip = Wip.parse(wip_branch)
+	owner = wip.owner
+	if owner != conf.id:
+		die("WIP branch belongs to %s, but this is %s" % (owner, conf.id))
+	return wip
+
+def assert_wip_branch(branch: Branch) -> WipBranch:
+	if not is_wip_branch(branch):
+		die("not a WIP branch: %s" % (branch,))
+	return WipBranch(branch)
+
+def assert_base_branch(branch: Optional[Branch]) -> BaseBranch:
+	if is_wip_branch(branch):
+		die("WIP branch: %s" % (branch,))
+	return BaseBranch(branch)
+
+def is_my_wip_branch(conf: MachineConfig, branch: Optional[Branch]) -> bool:
+	if is_wip_branch(branch):
+		return Wip.parse(assert_wip_branch(branch)).owner == conf.id
+	return False
+
+def wip_refs() -> Dict[Ref,WipRef]:
+	lines = list(filter(bool, run_output(['git', 'show-ref'], dry=RUN_ANYWAY).splitlines()))
+	rv = {}
+	for line in lines:
+		sha, ref = line.split(' ', 1)
+		ref = Ref(ref)
+		sha = Sha(sha)
+		result = WipRef.try_parse(ref, sha)
+		if result is not None:
+			rv[ref] = result
+	return rv
+
+def once(fn):
+	undefined = Sentinel('undefined')
+	result = undefined
+	def wrapped():
+		nonlocal result
+		if result is undefined:
+			result = fn()
+		return result
+	return wrapped
+
+@once
+def available_remotes() -> List[Remote]:
+	return list(map(Remote, filter(bool, run_output(['git', 'remote'], dry=RUN_ANYWAY).splitlines())))
+
+def is_ancestor(parent, child):
+	return try_run(['git', 'merge-base', '--is-ancestor', parent, child], dry=RUN_ANYWAY)
+
+def current_ref() -> Optional[Ref]:
+	ref = try_run_output(['git', 'symbolic-ref', '-q', 'HEAD'], dry=RUN_ANYWAY)
+	if not ref:
+		return None
+	return Ref(ref)
+
+def current_commit() -> Sha:
+	return Sha(run_output(['git', 'rev-parse', 'HEAD'])
+
+# typed git wrappers
+
+def git_update_ref(ref: Ref, commit: Commitish):
+	run(['git', 'update-ref', ref, commit])
+
+def git_checkout_commitish(commit: Commitish):
+	run(['git', 'checkout', commit, '--'])
+
+def git_checkout_branch(branch: Branch):
+	git_checkout_commitish(branch)
+
+def git_fetch(remote: Remote, refspec: str):
+	run(['git', 'fetch', remote, 'refs/heads/wip/*'])
+
+def parents_of_merge_commit(sha: str) -> List[str]:
+	output = run_output(['git', 'cat-file', '-p', sha])
+	parents = []
+	for line in output.splitlines():
+		prefix = 'parent: '
+		if line.startswith(prefix):
+			parents.append(remove_leading(prefix, line).strip())
+		if not line:
+			break
+	assert len(parents > 1), "couldn't find parents of merge commit %s" % (sha,)
+	return parents
+
+# idempotent IO functions
+
+def ensure_wip_branch(conf: MachineConfig) -> None:
+	logging.debug('ensuring WIP branch')
+	ref = current_ref()
+	branch = branch_of_ref(ref)
+	if is_wip_branch(branch=branch):
+		wip_branch = assert_my_wip_branch(conf, branch)
+		logging.debug('currently on WIP branch for (%s)' % (wip_branch.base))
+		return
+	else:
+		my_wip = my_wip_branch(conf=conf, base=assert_base_branch(branch))
+		logging.debug('checking out %s (from %s)' % (my_wip, branch))
+		git_update_ref(ref_of_branch(my_wip), Commitish('HEAD'))
+		git_checkout_branch(my_wip)
+
+def save_changes(conf: MachineConfig) -> None:
+	if is_dirty():
+		ensure_wip_branch(conf)
+		# there are some changes
+		if not try_run(['git', 'diff-index', '--quiet', 'HEAD', '--cached', '--'], dry=RUN_ANYWAY):
+			# staged changes
+			logging.info('storing staged changes...')
+			run(['git', 'commit', '-m', 'WIP (staged)'])
+		logging.info('storing uncommitted changes...')
+		run(['git', 'commit', '-a', '-m', 'WIP (uncommitted)'])
+
+def pull_changes(remote: Remote) -> None:
+	logging.info('fetching wips from %s...' % (remote,))
+	git_fetch(remote, 'refs/heads/wip/*')
+
+def rebase_my_refs(conf: MachineConfig, refs: List[WipRef]) -> None:
+	my_local_refs = RefFilter.mine(RefFilter.local(refs))
+	merge_refs = RefFilter.merges(refs)
+	original_commitish: Commitish = None
+
+	try:
+		for local in my_local_refs:
+			merge_head = first(RefFilter.for_base(local.wip.base, merge_refs))
+			if merge_head is None:
+				logging.debug("no merge branch found for %s" % (local.wip.base))
+				continue
+
+			logging.debug("merge branch found for %s: %s" % (local.wip.base, merge_head.sha))
+			mainline_merge_base = run_output(['git', 'merge-base', merge_head.sha, local.wip.base])
+			wip_merge_base = run_output(['git', 'merge-base', merge_head.sha, local.sha])
+
+			if VERBOSE:
+				run(['git', 'show-branch', local.ref, merge_head.ref, local.wip.base], dry=RUN_ANYWAY)
+
+			if is_ancestor(local.sha, merge_head.sha):
+				logging.debug('wip branch is fully merged; resetting the current base branch')
+				git_update_ref(local.wip.ref, local.wip.base)
+			elif if is_ancestor(mainline_merge_base, local.sha):
+				logging.debug('local branch is already based of the latest merged commit')
+			else:
+				logging.debug('comit %s in wip branch has already been merged; rebasing onto base branch as of %s' % (
+					wip_merge_base, mainline_merge_base))
+
+				parents = parents_of_merge_commit(merge_head.sha)
+				logging.debug('checking which parent of %r is on branch %s' % (
+					parents, local.wip.base))
+				mainline_parent = only(filter(lambda commit: is_ancestor(commit, local.wip.base)))
+
+				if original_commitish is None:
+					# store original commit/branch for restoration
+					ref = current_ref()
+					original_commitish = current_ref()
+					if ref is not None:
+						# might be a branch
+						branch = branch_of_ref(ref)
+						original_commitish = commitish_of_branch(branch) if branch else commitish_of_ref(ref)
+					else:
+						# not a ref
+						original_commitish = commitish_of_sha(current_commit())
+					assert original_commitish is not None
+
+				logging.info('rebasing %s onto %s' % (local.wip.branch, mainline_parent))
+				git_checkout_branch(local.wip.branch)
+
+				# XXX breaks if path has spaces:
+				sequence_editor = [sys.executable, __file__]
+				if VERBOSE:
+					sequence_editor.append('--verbose')
+				sequence_editor.append('rebase-sequence')
+				run(['git','rebase', '-i', TODO...], env={
+					'GIT_SEQUENCE_EDITOR': ' '.join(sequence_editor),
+					'GIT_WIP_KEEP_COMMITS': ' '.join(keep_commits),
+					'GIT_WIP_DROP_COMMITS': ' '.join(drop_commits),
+				})
+		finally:
+			if original_commitish is not None:
+				git_checkout_commitish(original_commitish)
+
+def update_my_refs(conf: MachineConfig, refs: List[WipRef]) -> List[PushSpec]:
+	result = []
+	my_refs = RefFilter.mine(conf, refs)
+	my_local_refs = RefFilter.local(my_refs)
+	my_remote_refs = RefFilter.remote(my_refs)
+
+	for local in my_local_refs:
+		branch = local.wip.branch
+		remote = first(RefFilter.for_base(local.wip.base, my_remote_refs), None)
+		if remote is None:
+			result.append(PushSpec.track(branch))
+			logging.debug("remote branch %s will be created at %s" % (
+				branch, local.sha))
+		elif remote.sha != local.sha:
+			force = not is_ancestor(remote.sha, local.sha)
+			logging.debug("remote branch %s (at %s) will be %s to %s" % (
+				branch, remote.sha, 'force pushed' if force else 'fast forwarded', local.sha)
+			result.append(PushSpec.track(branch), force=force)
+		else:
+			logging.debug("remote branch %s is up to date")
+
+def update_refs(conf: MachineConfig) -> List[PushSpec]:
+	return []
+	modified = []
+	refs: List[WipRef]
+
+	def refresh():
+		nonlocal refs
+		refs = wip_refs().values()
+
+	refresh()
+
+	# rebase my refs if any have been merged
+	rebase_my_refs(refs)
+	refresh()
+
+	# push any refs that are out of date
+	result.extend(update_my_refs(refs))
+
+	# also update and push HEAD refs when possible:
+
+
+	# branch_refs = itertools.groupby(lambda ref: ref.base, refs)
+  #
+	# for ref in my_refs:
+	# 	logging.info("processing ref %s" % (ref.ref))
+	# 	other_refs = list(filter(lambda other: other.base == ref.base))
+	# 	other_host_refs = list(filter(lambda other: other.owner is not None and other.owner != conf.id))
+  #
+	# 	if all(map(lambda wip: is_ancestor(wip.ref, ref.ref), other_refs)):
+	# 		logging.info("updating canonical wip for branch %s" % (ref.base))
+	# 		canonical_branch = canonical_wip_branch(ref.base)
+	# 		canonical_ref = ref_of_branch(canonical_branch)
+	# 		run(['git', 'update-ref', canonical_ref, my_wip_ref])
+	# 		modified.append(canonical_ref)
+	# 	else:
+	# 		logging.info("multiple WIP heads found, not updating %s" % (ref.base,))
+  #
+	# if my_wip_ref not in refs:
+	# 	logging.warn('no local wip branch found; not updating (try `git wip save`?)')
+	# 	return
+  #
+	# my_sha = refs[my_wip_ref]
+	# del refs[my_wip_ref]
+  #
+	# to_push = [my_wip_ref]
+	# if all(map(lambda wip: is_ancestor(wip, my_sha))):
+	# 	logging.info("updating canonical wip")
+	# 	canonical_branch = canonical_wip_branch(branch)
+	# 	canonical_ref = ref_of_branch(canonical_branch)
+	# 	run(['git', 'update-ref', canonical_ref, my_wip_ref])
+	# 	to_push.append(canonical_ref)
+	# else:
+	# 	logging.info("multiple WIP heads found, not updating canonical WIP")
+	#
+	# return to_push
+
+def push_refs(remote: Remote, specs: List[PushSpec]) -> None:
+	if not refs:
+		logging.debug("Nothing to push")
+		return
+
+	def do_push(specs: Iterable[PushSpec], force: bool):
+		if not refs:
+			continue
+		cmd = ['git', 'push']
+		if force:
+			cmd.append('-f')
+		cmd.append(remote)
+		cmd.extend([spec.spec for spec in specs])
+		run(cmd)
+
+	do_push(filter(lambda spec: spec.force, spec), force=True)
+	do_push(filter(lambda spec: not spec.force, spec), force=False)
+
+## Utils:
+
+def die(msg: str) -> None:
+	logging.error(msg)
+	sys.exit(1)
+
+T = Typevar('T')
+undefined = Sentinel('undefined')
+def first(items: Iterable[T], dfl: T = undefined) -> T:
+	try:
+		return next(iter(items))
+	except StopIteration:
+		if dfl is undefined:
+			raise ValueError('empty iterable')
+		return dfl
+
+def only(items: List[T]) -> T:
+	if len(items) != 1:
+		raise ValueError('expected single-length list, git %r' % (items,))
+	return items[0]
+
+## CLI actions:
+
+def save_action(conf: MachineConfig, opts):
+	logging.info('- Saving')
+	ensure_wip_branch(conf)
+	save_changes(conf)
+	update_refs(conf)
+
+def pull_action(conf: MachineConfig, opts):
+	logging.info('- Pulling')
+	pull_changes(conf.remote(opts))
+	update_refs(conf)
+
+def sync_action(conf: MachineConfig, opts):
+	pull_action(conf, opts)
+	push_action(conf, opts)
+
+def push_action(conf: MachineConfig, opts):
+	logging.info('- Pushing')
+	refs = update_refs(conf)
+	push_refs(conf.remote(opts), refs)
+
+def diff_action(conf: MachineConfig, opts):
+	ref : Ref = current_ref()
+	branch : WipBranch = assert_wip_branch(branch_of_ref(ref))
+	base: BaseBranch = base_branch_of_wip_branch(branch)
+	run(['git', 'diff', base], dry=RUN_ANYWAY)
+
+def merge_action(conf: MachineConfig, opts):
+	if is_dirty():
+		die('you have uncommitted changes')
+	ref: Ref = current_ref()
+	branch: Branch = branch_of_ref(ref)
+	if branch is None:
+		die('not on a branch')
+	
+	base: BaseBranch = base_branch_of_wip_branch(assert_wip_branch(branch))
+
+	refs: Dict[Ref,WipRef] = wip_refs()
+	canonical_branch: Branch = canonical_wip_branch(base)
+
+	try:
+		wip_ref: WipRef = refs[ref]
+		if refs[ref_of_branch(canonical_branch)] != wip_ref:
+			die('%s and %s are different commits (try `git wip save`)' % (canonical_branch, branch))
+	except KeyError as e:
+		die('missing ref: %s' % e)
+
+	logging.debug("merging into %s" % (base,))
+
+	# XXX might leave us stranded on base branch...
+	git_checkout_branch(base)
+	if try_run(['git', 'merge', '--squash', '--edit', '--no-ff', ref], dry=True):
+		# OK, merge succeeded. update wip/<branch>/MERGE to mark when these WIP commits were merged
+		merge_branch = merge_wip_branch(base)
+		if ref_of_branch(merge_branch) not in refs:
+			EMPTY_TREE='4b825dc642cb6eb9a060e54bf8d69288fbee4904' # It's Magic(tm) (http://colinschimmelfing.com/blog/gits-empty-tree/)
+			empty_commit = run_output(['git', 'commit-tree', EMPTY_TREE, '-m', 'empty'], dry='FAKE_COMMIT')
+			git_update_ref(ref_of_branch(merge_branch), Commitish(empty_commit))
+		git_checkout_branch(merge_branch)
+		run(['git', 'merge', '-m', 'merge %s' % (branch), '-s', 'ours', '--', base, canonical_branch])
+	else:
+		logging.warn('merge failed, reverting back to %s' % (ref,))
+		run(['git', 'merge', '--abort'])
+		git_checkout_branch(branch)
+
+def perform_interactive_rebase(filename: str):
+	commits = []
+	with open(filename) as f:
+		for lines in f:
+			line = line.strip()
+			if line.startswith('#'):
+				logging.debug('dropping line: %s' % (line,))
+			else:
+				commits.append(line.split()[0])
+	logging.debug('original commit seqence: %r' % (commits,))
+
+	keep_commits = os.environ['GIT_WIP_KEEP_COMMITS']
+	drop_commits = os.environ['GIT_WIP_DROP_COMMITS']
+	expected_commits = set(keep_commits).union(drop_commits)
+	if set(commits) != expected_commits:
+		die('Expected commits: %r. Got %r' % (expected_commits, commits))
+
+	with open(filename, 'w') as f:
+		for commit in commits:
+			if commit in keep_commits:
+				logging.debug('keeping commit %s' % (commit,))
+				print('keep ' + commit, file=f)
+			else:
+				logging.debug('dropping commit %s' % (commit,))
+
+## main
+
+def main() -> None:
+	global DRY_RUN, VERBOSE
+	p = optparse.OptionParser()
+	p.add_option('-v', '--verbose', action='store_true')
+	p.add_option('-n', '--dry-run', action='store_true')
+	p.add_option('-r', '--remote', action='store')
+
+	opts, args = p.parse_args()
+	logging.basicConfig(
+		format='%(levelname)5s: %(message)s',
+		level = (logging.DEBUG if opts.verbose else logging.INFO)
+	)
+
+	if opts.dry_run:
+		DRY_RUN = True
+	if opts.verbose:
+		VERBOSE = True
+
+	if 'rebase-sequence' in args:
+		(filename,) = args
+		perform_interactive_rebase(filename)
+
+	if len(args) == 0:
+		args = ['save', 'sync']
+
+
+	actions: Dict[str,Callable[[MachineConfig, Any],None]] = {
+		'pull': pull_action,
+		'save': save_action,
+		'sync': sync_action, # TODO: push?
+		'diff': diff_action,
+		'merge': merge_action,
+	}
+	unknown_actions = set(args).difference(actions.keys())
+	if unknown_actions:
+		die("Unknown action(s): %s" % (', '.join(sorted(unknown_actions)),))
+
+	conf = MachineConfig.load()
+
+	for action in args:
+		actions[action](conf, opts)
+
+if __name__ == '__main__':
+	main()
