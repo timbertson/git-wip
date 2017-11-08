@@ -1,0 +1,5 @@
+#!bash -eu
+mypy="$(nix-which mypy)"
+gup -u git-wip
+[ -n "$mypy" ]
+"$mypy/bin/mypy" --strict-optional ./git-wip
