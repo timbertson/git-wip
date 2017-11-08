@@ -260,14 +260,14 @@ class MachineConfig(object):
 		return available[0]
 
 	@classmethod
-	def load(cls, path) -> 'MachineConfig':
+	def load(cls, path: Optional[str]) -> 'MachineConfig':
 		allow_missing = False
 		if path is None:
 			allow_missing = True
 			config_dir = os.environ.get('XDG_CONFIG_HOME')
 			if config_dir is None:
 				config_dir = os.path.expanduser('~/.config')
-			path = os.path.join(config_dir, 'git-wip')
+			path = os.path.join(config_dir, 'git-wip', 'config.json')
 		try:
 			with open(path) as f:
 				return MachineConfig(json.load(f))
@@ -357,6 +357,7 @@ def is_my_wip_branch(conf: MachineConfig, branch: Optional[Branch]) -> bool:
 		return Wip.parse(assert_wip_branch(branch)).owner == conf.id
 	return False
 
+#TODO: filter to main remote (via --remote or config.[base_branch].remote)
 def wip_refs() -> Dict[Ref,WipRef]:
 	lines = list(filter(bool, run_output(['git', 'show-ref'], dry=RUN_ANYWAY).splitlines()))
 	rv = {}
