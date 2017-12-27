@@ -1,0 +1,6 @@
+{
+	"type": "fetchFromGitHub",
+	"repo": "git-wip",
+	"owner": "timbertson",
+	"rev": "version-{version}"
+}
