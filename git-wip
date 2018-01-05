@@ -335,7 +335,7 @@ def try_run_output(cmd, dry) -> Optional[str]:
 ## pure functions
 
 def has_changes(cached: bool = False) -> bool:
-	cmd = ['git', 'diff-index', '--quiet']
+	cmd = ['git', 'diff-index', '--ignore-submodules=all', '--quiet']
 	if cached:
 		cmd.append('--cached')
 	cmd.extend([HEAD, '--'])
