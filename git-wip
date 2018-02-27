@@ -741,7 +741,10 @@ def fetch_action(conf: Config):
 		if local_merge is not None:
 			update_merge_branch(remote_merge, local_merge)
 
-def update_action(conf: Config):
+def show_update_action(conf: Config):
+	update_action(conf, show=True)
+
+def update_action(conf: Config, show=False):
 	refs = list(wip_refs(conf.remote()).values())
 	current_checkout = CurrentCheckout()
 
@@ -765,9 +768,13 @@ def update_action(conf: Config):
 		unmerged_branches: List[Ref] = list(map(lambda wip: wip.ref, unmerged_remote_wips))
 		if not is_ancestor(base, my_wip.branch):
 			unmerged_branches.append(ref_of_branch(base))
-		logging.info('merging: %s' % (', '.join(unmerged_branches)))
-		args: List[str] = [x for x in unmerged_branches] # type coersion
-		git_merge(['--no-edit'] + args)
+		if show:
+			args: List[str] = [x for x in unmerged_branches] # type coersion
+			run(['git', 'show-branch', base, my_wip.branch] + args, dry=RUN_ANYWAY)
+		else:
+			logging.info('merging: %s' % (', '.join(unmerged_branches)))
+			args: List[str] = [x for x in unmerged_branches] # type coersion
+			git_merge(['--no-edit'] + args)
 
 	with current_checkout.restoring():
 		if conf.opts.branch:
@@ -868,7 +875,7 @@ def merge_action(conf: Config):
 
 	refs: Dict[Ref,WipRef] = wip_refs(conf.remote())
 	wip_ref: WipRef = refs[ref]
-	logging.debug("merging into %s" % (base,))
+	logging.info("merging branch %s (%s) into %s" % (branch, wip_ref.sha, base,))
 	merge_branch = ensure_merge_branch(conf, base)
 
 	current_checkout = CurrentCheckout()
@@ -964,6 +971,8 @@ def main() -> None:
 		'sync': sync_action,
 		'push': push_action,
 		'diff': diff_action,
+		'update': update_action,
+		'show-update': show_update_action,
 		'merge': merge_action,
 		'help': help_action,
 	}
