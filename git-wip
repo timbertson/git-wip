@@ -623,16 +623,13 @@ def get_pushable_refs(conf: Config) -> List[PushSpec]:
 		else:
 			if local_merge.sha == remote_merge.sha:
 				logging.debug('remote branch %s is up to date (%s)' % (branch, remote_merge.sha))
-			elif is_ancestor(remote_merge.sha, local_merge.sha):
+			else:
 				logging.debug('pushing update to %s (%s -> %s)' % (
 					branch,
 					remote_merge.sha,
 					local_merge.sha
 				))
-				result.append(PushSpec.track(branch))
-			else:
-				die('local merge branch %s has diverged from remote %s' % (
-					branch, remote_merge.ref))
+				result.append(PushSpec.track(branch, force=True))
 
 	return result
 
@@ -882,7 +879,7 @@ def merge_action(conf: Config):
 	with current_checkout.restoring():
 		current_checkout.move(base)
 		git_merge(['--squash', ref])
-		run(['git', 'commit', '--edit', '-m', 'merge WIP changes'])
+		run(['git', 'commit', '-v', '--edit', '-m', 'merge WIP changes'])
 		# OK, merge succeeded. update wip/<branch>/MERGE to mark when these WIP commits were merged
 		merge_commit = Sha(run_output(['git', 'commit-tree', EMPTY_TREE, '-m', 'merge'], dry='MERGE_SHA'))
 		git_update_ref(ref_of_branch(merge_branch), merge_commit)
