@@ -727,6 +727,7 @@ def save_action(conf: Config):
 	# update_refs(conf)
 
 def fetch_action(conf: Config):
+	if conf.opts.offline: return False
 	pull_changes(conf.remote())
 	merge_refs = RefFilter.merges(list(wip_refs(conf.remote()).values()))
 	remote_merge_refs = RefFilter.remote(merge_refs)
@@ -739,9 +740,13 @@ def fetch_action(conf: Config):
 			update_merge_branch(remote_merge, local_merge)
 
 def show_update_action(conf: Config):
-	update_action(conf, show=True)
+	_update_action(conf, show=True)
 
-def update_action(conf: Config, show=False):
+def update_action(conf: Config):
+	fetch_action(conf)
+	_update_action(conf, show=False)
+
+def _update_action(conf: Config, show=False):
 	refs = list(wip_refs(conf.remote()).values())
 	current_checkout = CurrentCheckout()
 
@@ -833,6 +838,7 @@ def sync_action(conf: Config):
 	push_action(conf)
 
 def push_action(conf: Config):
+	if conf.opts.offline: return
 	refs = get_pushable_refs(conf)
 	push_refs(conf.remote(), refs)
 	fetch_action(conf)
@@ -935,6 +941,7 @@ def main() -> None:
 	p = optparse.OptionParser(usage=usage)
 	p.add_option('-v', '--verbose', action='store_true')
 	p.add_option('-n', '--dry-run', action='store_true')
+	p.add_option('-o', '--offline', action='store_true')
 	p.add_option('-r', '--remote', action='store')
 	p.add_option('-c', '--config', action='store')
 	p.add_option('-b', '--branch', action='store')
