@@ -770,6 +770,9 @@ def _update_action(conf: Config, show=False):
 		unmerged_branches: List[Ref] = list(map(lambda wip: wip.ref, unmerged_remote_wips))
 		if not is_ancestor(base, my_wip.branch):
 			unmerged_branches.append(ref_of_branch(base))
+		if not unmerged_branches:
+			logging.info('%s is up to date with %s' % (my_wip.branch, ', '.join([wip.wip.branch for wip in remote_refs])))
+			return
 		if show:
 			args: List[str] = [x for x in unmerged_branches] # type coersion
 			run(['git', 'show-branch', base, my_wip.branch] + args, dry=RUN_ANYWAY)
