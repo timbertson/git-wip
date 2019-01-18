@@ -276,7 +276,10 @@ class Config(object):
 				return configured
 		if not available:
 			die("No remotes configured")
-		return available[0]
+		if 'origin' in available:
+			return Remote('origin')
+		else:
+			return available[0]
 
 	@classmethod
 	def load(cls, path: Optional[str], opts: Any) -> 'Config':
@@ -768,23 +771,25 @@ def _update_action(conf: Config, show=False):
 
 		unmerged_remote_wips = filter(is_unmerged, remote_refs)
 		unmerged_branches: List[Ref] = list(map(lambda wip: wip.ref, unmerged_remote_wips))
+		args: List[str] = []
 		if not is_ancestor(base, my_wip.branch):
 			unmerged_branches.append(ref_of_branch(base))
 		if not unmerged_branches:
 			logging.info('%s is up to date with %s' % (my_wip.branch, ', '.join([wip.wip.branch for wip in remote_refs])))
 			return
 		if show:
-			args: List[str] = [x for x in unmerged_branches] # type coersion
+			args = [x for x in unmerged_branches] # type coersion
 			run(['git', 'show-branch', base, my_wip.branch] + args, dry=RUN_ANYWAY)
 		else:
 			logging.info('merging: %s' % (', '.join(unmerged_branches)))
-			args: List[str] = [x for x in unmerged_branches] # type coersion
+			args = [x for x in unmerged_branches] # type coersion
 			git_merge(['--no-edit'] + args)
 
 	with current_checkout.restoring():
 		if conf.opts.branch:
 			update_branch(assert_base_branch(Branch(conf.opts.branch)))
 		else:
+			logging.info('Updating all branches with a local wip...')
 			my_refs = RefFilter.mine(conf, refs)
 			my_local_refs = RefFilter.local(my_refs)
 			# update all branches with a local wip
