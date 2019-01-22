@@ -33,8 +33,11 @@ Owner = NewType('Owner', str)
 Remote = NewType('Remote', str)
 Commitish = Union[Sha,Ref,Branch,WipBranch,BaseBranch]
 T = TypeVar('T')
+GitConfigKey = Tuple[Optional[Branch],str]
 
 # string manipulation functions
+CONFIG_SCOPE = 'wip'
+CONFIG_PREFIX = CONFIG_SCOPE + '.'
 WIP_PREFIX = 'wip/'
 BRANCH_PREFIX = 'refs/heads/'
 REMOTE_PREFIX = 'refs/remotes/'
@@ -242,25 +245,65 @@ class PushSpec(object):
 
 ## machine config
 
+class GitConfig(object):
+	def __init__(self, conf: Dict[GitConfigKey,List[str]], branch: Optional[Branch]):
+		self.conf = conf
+		self.branch = branch
+
+	def __str__(self):
+		return "GitConfig(%r, %r)" % self.conf, self.branch
+
+	def __getitem__(self, key: str) -> List[str]:
+		try:
+			return self.conf[GitConfig.key(key, scope=self.branch)]
+		except KeyError:
+			if self.branch:
+				# fallback to branch-agnostic config
+				return self.conf[GitConfig.key(key)]
+			else:
+				raise
+
+	@staticmethod
+	def key(key, scope=None) -> GitConfigKey:
+		return (scope, key)
+
 class Config(object):
 	opts: Any
 
-	def __init__(self, conf, opts):
+	def __init__(self, conf: Dict[str,Any], git_conf: GitConfig, opts):
 		logging.debug('Loaded machine config: %r' % (conf,))
+		logging.debug('Loaded git config: %r' % (git_conf,))
 		self.conf = conf
+		self.git_conf = git_conf
 		self.opts = opts
-	
-	def get(self, name, dfl):
-		if self.conf is not None:
-			try:
-				return self.conf[name]
-			except KeyError:
-				pass
+
+	def _get_any(self, name, dfl) -> Any:
+		try:
+			return self.git_conf[name]
+		except KeyError:
+			pass
+
+		try:
+			return self.conf[name]
+		except KeyError:
+			pass
 		return dfl
+
+	def get_all(self, name, dfl) -> List[Any]:
+		value = self._get_any(name, dfl)
+		if not isinstance(value, list):
+			value = [value]
+		return value
+
+	def get_first(self, name, dfl) -> Any:
+		value = self._get_any(name, dfl)
+		if isinstance(value, list):
+			value = value[0]
+		return value
 
 	@property
 	def id(self) -> Owner:
-		id = self.get('id', None)
+		id = self.get_first('id', None)
 		if id is None:
 			id = socket.gethostname()
 		assert bool(id)
@@ -269,7 +312,7 @@ class Config(object):
 	def remote(self) -> Remote:
 		if self.opts.remote is not None:
 			return self.opts.remote
-		configured_remotes : List[Remote] = list(map(Remote, self.get('remotes', [])))
+		configured_remotes : List[Remote] = list(map(Remote, self.get_all('remote', [])))
 		available = available_remotes()
 		for configured in configured_remotes:
 			if configured in available:
@@ -284,6 +327,7 @@ class Config(object):
 	@classmethod
 	def load(cls, path: Optional[str], opts: Any) -> 'Config':
 		allow_missing = False
+		loaded_config: Dict[str,Any] = {}
 		if path is None:
 			allow_missing = True
 			config_dir = os.environ.get('XDG_CONFIG_HOME')
@@ -292,13 +336,35 @@ class Config(object):
 			path = os.path.join(config_dir, 'git-wip', 'config.json')
 		try:
 			with open(path) as f:
-				return Config(json.load(f), opts)
+				loaded_config = json.load(f)
 		except OSError as e:
 			if allow_missing and e.errno == errno.ENOENT:
 				pass
 			else:
 				raise
-		return Config(None, opts)
+
+		conf_output = subprocess.check_output(['git', 'config', '--list', '--null'])
+		git_conf: Dict[GitConfigKey,List[str]] = {}
+		for kv in conf_output.split(b'\0'):
+			if len(kv) == 0: continue
+			key, value = kv.decode('utf-8').split('\n', 1)
+			if key.startswith(CONFIG_PREFIX):
+				key = key.split('.')
+				key.pop(0)
+				key_leaf = key.pop()
+				key_scope = Branch('.'.join(key)) if key else None
+				key = GitConfig.key(key_leaf, scope=key_scope)
+
+				# insert all values as lists
+				try:
+					dest = git_conf[key]
+				except KeyError:
+					dest = []
+					git_conf[key] = dest
+				dest.append(value)
+
+		base_branch = get_base_branch(opts)
+		return Config(loaded_config, GitConfig(git_conf, base_branch), opts)
 
 # command runners
 
@@ -808,34 +874,32 @@ def delete_wip_branch_for(conf: Config, base: BaseBranch):
 	run(['git', 'branch', '-D', wip_branch])
 
 def delete_action(conf: Config):
-	if conf.opts.branch:
-		delete_wip_branch_for(conf, assert_base_branch(conf.opts.branch))
-	else:
-		# delete current branch
-		branch = current_branch()
-		if not branch:
-			die('not on a branch (and --branch  not specified)')
-		if is_wip_branch(branch):
-			base_branch = Wip.parse(assert_wip_branch(branch)).base
-		else:
-			base_branch = assert_base_branch(branch)
-		delete_wip_branch_for(conf, base_branch)
+	base_branch = require_base_branch(conf.opts)
+	delete_wip_branch_for(conf, base_branch)
 
-def specified_base_branch(opts) -> BaseBranch:
+def get_base_branch(opts) -> Optional[BaseBranch]:
 	if opts.branch:
 		base_branch = assert_base_branch(opts.branch)
 	else:
 		branch = current_branch()
 		if not branch:
-			die('not on a branch (and --branch  not specified)')
+			return None
 		if is_wip_branch(branch):
 			base_branch = Wip.parse(assert_wip_branch(branch)).base
 		else:
 			base_branch = assert_base_branch(branch)
 	return base_branch
 
+def require_base_branch(opts) -> BaseBranch:
+	branch = get_base_branch(opts)
+	if not branch:
+		die('not on a branch (and --branch  not specified)')
+		assert False # dumb typechecker, die never returns
+	else:
+		return branch
+
 def checkout_action(conf: Config):
-	base = specified_base_branch(conf.opts)
+	base = require_base_branch(conf.opts)
 	git_checkout_branch(base)
 	ensure_wip_branch(conf)
 
@@ -858,7 +922,7 @@ def diff_action(conf: Config):
 	run(['git', 'diff', base], dry=RUN_ANYWAY)
 
 def show_action(conf: Config):
-	base: BaseBranch = specified_base_branch(conf.opts)
+	base: BaseBranch = require_base_branch(conf.opts)
 	refs = RefFilter.non_merges(RefFilter.for_base(base, list(wip_refs(conf.remote()).values())))
 	local_refs = RefFilter.local(refs)
 	remote_refs = RefFilter.remote(RefFilter.for_other_machines(conf, refs))
