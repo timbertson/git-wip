@@ -309,20 +309,21 @@ class Config(object):
 		assert bool(id)
 		return Owner(id)
 
-	def remote(self) -> Remote:
+	def explicit_remote(self) -> Optional[Remote]:
+		return self.opts.remote
+
+	def remotes(self) -> List[Remote]:
 		if self.opts.remote is not None:
-			return self.opts.remote
-		configured_remotes : List[Remote] = list(map(Remote, self.get_all('remote', [])))
+			return [self.opts.remote]
+		configured_remotes : List[Remote] = list(map(Remote, self.get_all('remote', ['origin'])))
+		logging.debug('configured remotes: %r' % configured_remotes,)
 		available = available_remotes()
-		for configured in configured_remotes:
-			if configured in available:
-				return configured
 		if not available:
 			die("No remotes configured")
-		if 'origin' in available:
-			return Remote('origin')
-		else:
-			return available[0]
+		filtered = list(filter(lambda x: x in available, configured_remotes))
+		if filtered:
+			return filtered
+		return available
 
 	@classmethod
 	def load(cls, path: Optional[str], opts: Any) -> 'Config':
@@ -612,7 +613,7 @@ def update_merge_branch(remote_merge: RemoteWipRef, local_merge: LocalWipRef):
 		die('local branch %s has diverged from %s' % (local_merge.wip.branch, remote_merge.ref))
 
 def ensure_merge_branch(conf: Config, base: BaseBranch) -> WipBranch:
-	refs = list(wip_refs(conf.remote()).values())
+	refs = list(wip_refs(conf.explicit_remote()).values())
 	merges = RefFilter.merges(RefFilter.for_base(base, refs))
 	local_merge = first(RefFilter.local(merges))
 	remote_merge = first(RefFilter.remote(merges))
@@ -655,7 +656,7 @@ def pull_changes(remote: Remote) -> None:
 		'+' + WIP_REF_PREFIX + '*:' + REMOTE_PREFIX + remote + SLASH + WIP_PREFIX + '*')
 
 def get_pushable_refs(conf: Config) -> List[PushSpec]:
-	refs = list(wip_refs(conf.remote()).values())
+	refs = list(wip_refs(conf.explicit_remote()).values())
 	result = []
 	my_refs = RefFilter.mine(conf, refs)
 	my_local_refs = RefFilter.local(my_refs)
@@ -768,7 +769,7 @@ def branch_status(conf: Config):
 def status_action(conf: Config):
 	print("")
 	branch_status(conf)
-	refs = list(wip_refs(conf.remote()).values())
+	refs = list(wip_refs(conf.explicit_remote()).values())
 	if refs:
 		def wip_name(ref: WipRef) -> str:
 			branch = branch_of_ref(ref.ref)
@@ -797,8 +798,9 @@ def save_action(conf: Config):
 
 def fetch_action(conf: Config):
 	if conf.opts.offline: return False
-	pull_changes(conf.remote())
-	merge_refs = RefFilter.merges(list(wip_refs(conf.remote()).values()))
+	for remote in conf.remotes():
+		pull_changes(remote)
+	merge_refs = RefFilter.merges(list(wip_refs(conf.explicit_remote()).values()))
 	remote_merge_refs = RefFilter.remote(merge_refs)
 	local_merge_refs = RefFilter.local(merge_refs)
 
@@ -816,7 +818,7 @@ def update_action(conf: Config):
 	_update_action(conf, show=False)
 
 def _update_action(conf: Config, show=False):
-	refs = list(wip_refs(conf.remote()).values())
+	refs = list(wip_refs(conf.explicit_remote()).values())
 	current_checkout = CurrentCheckout()
 
 	def update_branch(base: BaseBranch):
@@ -912,7 +914,8 @@ def sync_action(conf: Config):
 def push_action(conf: Config):
 	if conf.opts.offline: return
 	refs = get_pushable_refs(conf)
-	push_refs(conf.remote(), refs)
+	for remote in conf.remotes():
+		push_refs(remote, refs)
 	fetch_action(conf)
 
 def diff_action(conf: Config):
@@ -923,7 +926,7 @@ def diff_action(conf: Config):
 
 def show_action(conf: Config):
 	base: BaseBranch = require_base_branch(conf.opts)
-	refs = RefFilter.non_merges(RefFilter.for_base(base, list(wip_refs(conf.remote()).values())))
+	refs = RefFilter.non_merges(RefFilter.for_base(base, list(wip_refs(conf.explicit_remote()).values())))
 	local_refs = RefFilter.local(refs)
 	remote_refs = RefFilter.remote(RefFilter.for_other_machines(conf, refs))
 
@@ -948,7 +951,7 @@ def merge_action(conf: Config):
 	
 	base: BaseBranch = base_branch_of_wip_branch(assert_wip_branch(branch))
 
-	refs: Dict[Ref,WipRef] = wip_refs(conf.remote())
+	refs: Dict[Ref,WipRef] = wip_refs(conf.explicit_remote())
 	wip_ref: WipRef = refs[ref]
 	logging.info("merging branch %s (%s) into %s" % (branch, wip_ref.sha, base,))
 	merge_branch = ensure_merge_branch(conf, base)
