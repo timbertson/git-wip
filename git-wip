@@ -115,6 +115,9 @@ class Wip(object):
 	@property
 	def is_head(self) -> bool: return self.id == HEAD
 
+	def __repr__(self):
+		return "Wip(%s, %s)" % (self.base, self.id)
+
 class WipRef(object):
 	ref: Ref
 	wip: Wip
@@ -149,6 +152,9 @@ class WipRef(object):
 
 	def __eq__(self, other):
 		return type(self) == type(other) and self.ref == other.ref and self.sha == other.sha
+
+	def __repr__(self):
+		return "%s(%s, %s, %s)" % (type(self).__name__, self.ref, self.wip, self.sha)
 
 def split_remote(ref: Ref) -> Tuple[Remote, Branch]:
 	remote_and_branch = remove_leading(REMOTE_PREFIX, ref)
@@ -450,7 +456,7 @@ def wip_refs(remote: Optional[Remote]) -> Dict[Ref,WipRef]:
 	lines = list(filter(bool, run_output(['git', 'show-ref'], dry=RUN_ANYWAY).splitlines()))
 	rv = {}
 	if remote is None:
-		allow_remote = lambda _: False
+		allow_remote = lambda _: True
 	else:
 		allow_remote = lambda ref: ref.remote == remote
 
@@ -462,6 +468,7 @@ def wip_refs(remote: Optional[Remote]) -> Dict[Ref,WipRef]:
 		result = WipRef.try_parse(ref, sha)
 		if result is not None:
 			if isinstance(result, RemoteWipRef) and not allow_remote(result):
+				logging.debug("Skipping remote ref %s (looking for remote %s)" % (result, remote))
 				continue
 			rv[ref] = result
 	return rv
