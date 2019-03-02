@@ -916,6 +916,7 @@ def sync_action(conf: Config):
 	fetch_action(conf)
 	if has_changes():
 		save_action(conf)
+	_update_action(conf)
 	push_action(conf)
 
 def push_action(conf: Config):
@@ -1051,6 +1052,7 @@ def main() -> None:
 		'status': status_action,
 		'show': show_action,
 		'checkout': checkout_action,
+		'co': checkout_action,
 		'rm': delete_action,
 		'fetch': fetch_action,
 		'save': save_action,
