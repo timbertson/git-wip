@@ -916,7 +916,8 @@ def sync_action(conf: Config):
 	fetch_action(conf)
 	if has_changes():
 		save_action(conf)
-	_update_action(conf)
+	if conf.update is not False:
+		_update_action(conf)
 	push_action(conf)
 
 def push_action(conf: Config):
@@ -1025,6 +1026,7 @@ def main() -> None:
 	p.add_option('-v', '--verbose', action='store_true')
 	p.add_option('-n', '--dry-run', action='store_true')
 	p.add_option('-o', '--offline', action='store_true')
+	p.add_option('--no-update', action='store_false', dest='update', default=None)
 	p.add_option('-r', '--remote', action='store')
 	p.add_option('-c', '--config', action='store')
 	p.add_option('-b', '--branch', action='store')
