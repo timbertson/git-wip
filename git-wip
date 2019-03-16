@@ -921,7 +921,7 @@ def sync_action(conf: Config):
 	fetch_action(conf)
 	if has_changes():
 		save_action(conf)
-	if conf.update is not False:
+	if conf.opts.update is not False:
 		_update_action(conf)
 	push_action(conf)
 
