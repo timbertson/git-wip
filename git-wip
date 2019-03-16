@@ -232,22 +232,24 @@ def is_remote_wip_ref(ref: Ref):
 	return False
 
 class PushSpec(object):
-	def __init__(self, src: Branch, dest: Branch, force: bool) -> None:
+	def __init__(self, src: Branch, dest: Branch, remote: Optional[Remote], force: bool) -> None:
 		self.src = src
 		self.dest = dest
 		self.force = force
+		self.remote = remote
 	
-	@property
-	def spec(self):
+	def spec(self, remote: Remote):
+		if self.remote is not None and self.remote != remote:
+			return None
 		return "%s:%s" % (self.src, self.dest)
 
 	@classmethod
 	def track(cls, local: Branch, force = False) -> 'PushSpec':
-		return cls(local, local, force=force)
+		return cls(local, local, remote = None, force=force)
 
 	@classmethod
-	def delete(cls, remote: Branch) -> 'PushSpec':
-		return cls(Branch(''), remote, force=False)
+	def delete(cls, remote: Remote, branch: Branch) -> 'PushSpec':
+		return cls(Branch(''), branch, remote, force=False)
 
 ## machine config
 
@@ -380,24 +382,24 @@ class Config(object):
 
 # command runners
 
-def log_cmd(cmd):
-	logging.debug('+ ' + ' '.join(cmd))
+def log_cmd(cmd, lvl=logging.DEBUG):
+	logging.log(lvl, '+ ' + ' '.join(cmd))
 
-def run(cmd, dry=None) -> None:
-	log_cmd(cmd)
+def run(cmd, dry=None, lvl=logging.DEBUG) -> None:
+	log_cmd(cmd, lvl=lvl)
 	if DRY_RUN and dry is not RUN_ANYWAY:
 		return None
 	else:
 		subprocess.check_call(cmd)
 
-def run_output(cmd, dry) -> str:
-	log_cmd(cmd)
+def run_output(cmd, dry, lvl=logging.DEBUG) -> str:
+	log_cmd(cmd, lvl=lvl)
 	if DRY_RUN and dry is not RUN_ANYWAY:
 		return dry
 	return subprocess.check_output(cmd).decode('utf-8').rstrip()
 
-def try_run(cmd, dry) -> bool:
-	log_cmd(cmd)
+def try_run(cmd, dry, lvl=logging.DEBUG) -> bool:
+	log_cmd(cmd, lvl=lvl)
 	if DRY_RUN and dry is not RUN_ANYWAY:
 		result = dry
 	else:
@@ -407,9 +409,9 @@ def try_run(cmd, dry) -> bool:
 	logging.debug(' => %s' % (result,))
 	return result
 
-def try_run_output(cmd, dry) -> Optional[str]:
+def try_run_output(cmd, dry, lvl=logging.DEBUG) -> Optional[str]:
 	try:
-		return run_output(cmd, dry=dry)
+		return run_output(cmd, dry=dry, lvl=lvl)
 	except subprocess.CalledProcessError as e:
 		return None
 
@@ -679,23 +681,25 @@ def get_pushable_refs(conf: Config) -> List[PushSpec]:
 
 	for local in my_local_refs:
 		branch = local.wip.branch
-		remote = first(RefFilter.for_base(local.wip.base, my_remote_refs))
-		if remote is None:
+		remote_ref = first(RefFilter.for_base(local.wip.base, my_remote_refs))
+		if remote_ref is None:
 			result.append(PushSpec.track(branch))
 			logging.debug("remote branch %s will be created at %s" % (
 				branch, local.sha))
-		elif remote.sha != local.sha:
-			force = not is_ancestor(remote.sha, local.sha)
+		elif remote_ref.sha != local.sha:
+			force = not is_ancestor(remote_ref.sha, local.sha)
 			logging.debug("remote branch %s (at %s) will be %s to %s" % (
-				branch, remote.sha, 'force pushed' if force else 'fast forwarded', local.sha))
+				branch, remote_ref.sha, 'force pushed' if force else 'fast forwarded', local.sha))
 			result.append(PushSpec.track(branch, force=force))
 		else:
 			logging.debug("remote branch %s is up to date")
 	
-	for remote in my_remote_refs:
-		if first(RefFilter.for_base(remote.wip.base, my_local_refs)) is None:
-			logging.debug('removing remote branch %s' % (remote.wip.branch))
-			result.append(PushSpec.delete(remote.wip.branch))
+	for remote_ref in my_remote_refs:
+		if first(RefFilter.for_base(remote_ref.wip.base, my_local_refs)) is None:
+			remote = remote_ref.remote
+			branch = remote_ref.wip.branch
+			logging.debug('removing remote branch %s %s' % (remote, branch))
+			result.append(PushSpec.delete(remote, branch))
 
 	for local_merge in local_merge_refs:
 		branch = local_merge.wip.branch
@@ -725,17 +729,18 @@ def push_refs(remote: Remote, specs: List[PushSpec]) -> None:
 		logging.info("Nothing to push")
 		return
 	else:
-		logging.info("Pushing %d refs to %s" % (len(specs), remote))
+		logging.info("Pushing refs to %s" % (remote,))
 
 	def do_push(specs: Iterable[PushSpec], force: bool):
+		my_specs : List[str] = list(filter(None, [spec.spec(remote) for spec in specs]))
 		if not specs:
 			return
 		cmd = ['git', 'push']
 		if force:
 			cmd.append('-f')
 		cmd.append(remote)
-		cmd.extend([spec.spec for spec in specs])
-		run(cmd)
+		cmd.extend(my_specs)
+		run(cmd, lvl=logging.INFO)
 
 	do_push(filter(lambda spec: spec.force, specs), force=True)
 	do_push(filter(lambda spec: not spec.force, specs), force=False)
