@@ -296,7 +296,7 @@ class Config(object):
 			return value
 		except KeyError:
 			pass
-		logging.debug("config %s not found, returning default %r" % (dfl,))
+		logging.debug("config %s not found, returning default %r" % (name, dfl,))
 		return dfl
 
 	def get_all(self, name, dfl) -> List[Any]:
