@@ -278,21 +278,25 @@ class Config(object):
 
 	def __init__(self, conf: Dict[str,Any], git_conf: GitConfig, opts):
 		logging.debug('Loaded machine config: %r' % (conf,))
-		logging.debug('Loaded git config: %r' % (git_conf,))
 		self.conf = conf
 		self.git_conf = git_conf
 		self.opts = opts
 
 	def _get_any(self, name, dfl) -> Any:
 		try:
-			return self.git_conf[name]
+			value = self.git_conf[name]
+			logging.debug("got git config %r = %r" % (name, value))
+			return value
 		except KeyError:
 			pass
 
 		try:
-			return self.conf[name]
+			value = self.conf[name]
+			logging.debug("got JSON config %r = %r" % (name, value))
+			return value
 		except KeyError:
 			pass
+		logging.debug("config %s not found, returning default %r" % (dfl,))
 		return dfl
 
 	def get_all(self, name, dfl) -> List[Any]:
@@ -370,6 +374,7 @@ class Config(object):
 					git_conf[key] = dest
 				dest.append(value)
 
+		logging.debug('Loaded git config: %r' % git_conf,)
 		base_branch = get_base_branch(opts)
 		return Config(loaded_config, GitConfig(git_conf, base_branch), opts)
 
