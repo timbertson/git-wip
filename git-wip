@@ -29,7 +29,6 @@ Ref = NewType('Ref', str)
 Branch = NewType('Branch', str)
 BaseBranch = NewType('BaseBranch', Branch)
 WipBranch = NewType('WipBranch', Branch)
-Owner = NewType('Owner', str)
 Remote = NewType('Remote', str)
 Commitish = Union[Sha,Ref,Branch,WipBranch,BaseBranch]
 T = TypeVar('T')
@@ -47,14 +46,11 @@ HEAD_REF = Ref(HEAD)
 MERGE = 'MERGE'
 SPECIAL_OWNERS=set([HEAD,MERGE])
 
-def _make_wip_branch(base: BaseBranch, id: str) -> WipBranch:
-	return WipBranch(Branch(WIP_PREFIX + base + '/' + id))
+def make_wip_branch(base: BaseBranch) -> WipBranch:
+	return WipBranch(Branch(WIP_PREFIX + base))
 
-def my_wip_branch(conf, base: BaseBranch) -> WipBranch:
-	return _make_wip_branch(base, conf.id)
-
-def merge_wip_branch(base: BaseBranch) -> WipBranch:
-	return _make_wip_branch(base, MERGE)
+def merge_wip_branch() -> WipBranch:
+	return make_wip_branch(BaseBranch(Branch(MERGE)))
 
 def ref_of_branch(branch: Branch) -> Ref:
 	return Ref(BRANCH_PREFIX + branch)
@@ -84,39 +80,27 @@ def base_branch_of_wip_branch(branch: WipBranch) -> BaseBranch:
 
 class Wip(object):
 	base: BaseBranch
-	owner: Optional[Owner]
-	id: str
 
 	@classmethod
 	def parse(cls, branch: WipBranch) -> 'Wip':
-		base_and_owner = remove_leading(WIP_PREFIX, branch)
-		base, owner = base_and_owner.rsplit('/', 1)
-		return Wip(BaseBranch(base), owner)
+		base = remove_leading(WIP_PREFIX, branch)
+		return Wip(BaseBranch(base))
 
-	@classmethod
-	def mine(cls, conf: 'Config', base: BaseBranch) -> 'Wip':
-		return Wip(base, conf.id)
-
-	def __init__(self, base: BaseBranch, owner: str) -> None:
+	def __init__(self, base: BaseBranch) -> None:
 		self.base = base
-		self.id = owner
-		if owner in SPECIAL_OWNERS:
-			self.owner = None
-		else:
-			self.owner = Owner(owner)
 
 	@property
 	def branch(self) -> WipBranch:
-		return _make_wip_branch(self.base, self.id)
+		return make_wip_branch(self.base)
 
 	@property
-	def is_merge(self) -> bool: return self.id == MERGE
+	def is_merge(self) -> bool: return self.base == MERGE
 
 	@property
-	def is_head(self) -> bool: return self.id == HEAD
+	def is_head(self) -> bool: return self.base == HEAD
 
 	def __repr__(self):
-		return "Wip(%s, %s)" % (self.base, self.id)
+		return "Wip(%s)" % (self.base)
 
 class WipRef(object):
 	ref: Ref
@@ -191,14 +175,6 @@ class LocalWipRef(WipRef):
 
 class RefFilter(object):
 	@staticmethod
-	def mine(conf: 'Config', refs: Iterable[WipRef]) -> List[WipRef]:
-		return list(filter(lambda ref: ref.wip.owner == conf.id, refs))
-
-	@staticmethod
-	def for_other_machines(conf: 'Config', refs: Iterable[WipRef]) -> List[WipRef]:
-		return list(filter(lambda ref: ref.wip.owner is not None and ref.wip.owner != conf.id, refs))
-
-	@staticmethod
 	def merges(refs: Iterable[WipRef]) -> List[WipRef]:
 		return list(filter(lambda ref: ref.wip.is_merge, refs))
 
@@ -222,6 +198,12 @@ class RefFilter(object):
 	def remote(refs: Iterable[WipRef]) -> List[RemoteWipRef]:
 		return [ref for ref in refs if isinstance(ref, RemoteWipRef)]
 
+	@staticmethod
+	def for_remote(remote: Remote, wip: Wip, refs: Iterable[RemoteWipRef]) -> Optional[RemoteWipRef]:
+		def eq(remote_wip: RemoteWipRef):
+			return remote_wip.remote == remote and remote_wip.wip == wip
+		return first(filter(eq, refs))
+
 def is_wip_ref(ref: Ref):
 	return ref.startswith(WIP_REF_PREFIX)
 
@@ -232,10 +214,9 @@ def is_remote_wip_ref(ref: Ref):
 	return False
 
 class PushSpec(object):
-	def __init__(self, src: Branch, dest: Branch, remote: Optional[Remote], force: bool) -> None:
+	def __init__(self, src: Branch, dest: Branch, remote: Optional[Remote]) -> None:
 		self.src = src
 		self.dest = dest
-		self.force = force
 		self.remote = remote
 	
 	def spec(self, remote: Remote):
@@ -244,12 +225,12 @@ class PushSpec(object):
 		return "%s:%s" % (self.src, self.dest)
 
 	@classmethod
-	def track(cls, local: Branch, force = False) -> 'PushSpec':
-		return cls(local, local, remote = None, force=force)
+	def track(cls, local: Branch) -> 'PushSpec':
+		return cls(local, local, remote = None)
 
 	@classmethod
 	def delete(cls, remote: Remote, branch: Branch) -> 'PushSpec':
-		return cls(Branch(''), branch, remote, force=False)
+		return cls(Branch(''), branch, remote)
 
 ## machine config
 
@@ -312,14 +293,6 @@ class Config(object):
 		if isinstance(value, list):
 			value = value[0]
 		return value
-
-	@property
-	def id(self) -> Owner:
-		id = self.get_first('id', None)
-		if id is None:
-			id = socket.gethostname()
-		assert bool(id)
-		return Owner(id)
 
 	def explicit_remote(self) -> Optional[Remote]:
 		return self.opts.remote
@@ -435,11 +408,7 @@ def assert_some(x: Optional[T]) -> T:
 
 def assert_my_wip_branch(conf: Config, branch: Optional[Branch]) -> Wip:
 	wip_branch = assert_wip_branch(branch)
-	wip = Wip.parse(wip_branch)
-	owner = wip.owner
-	if owner != conf.id:
-		die("WIP branch belongs to %s, but this is %s" % (owner, conf.id))
-	return wip
+	return Wip.parse(wip_branch)
 
 def assert_wip_branch(branch: Optional[Branch]) -> WipBranch:
 	if not is_wip_branch(branch):
@@ -453,11 +422,6 @@ def assert_base_branch(branch: Optional[Branch]) -> BaseBranch:
 
 def asset_branch_exists(branch: Branch):
 	sha_of_commitish(branch)
-
-def is_my_wip_branch(conf: Config, branch: Optional[Branch]) -> bool:
-	if is_wip_branch(branch):
-		return Wip.parse(assert_wip_branch(branch)).owner == conf.id
-	return False
 
 def wip_refs(remote: Optional[Remote]) -> Dict[Ref,WipRef]:
 	lines = list(filter(bool, run_output(['git', 'show-ref'], dry=RUN_ANYWAY).splitlines()))
@@ -482,7 +446,6 @@ def wip_refs(remote: Optional[Remote]) -> Dict[Ref,WipRef]:
 
 undefined = Sentinel('undefined')
 def once(fn):
-	undefined = Sentinel('undefined')
 	result = undefined
 	def wrapped():
 		nonlocal result
@@ -584,11 +547,12 @@ class CurrentCheckout():
 	@contextlib.contextmanager
 	def restoring(self):
 		try:
-			# self.capture()
+			self.capture()
 			yield
 		finally:
 			self.restore()
 
+# TODO used?
 def parents_of_merge_commit(sha: str) -> List[str]:
 	output = run_output(['git', 'cat-file', '-p', sha], dry=RUN_ANYWAY)
 	parents = []
@@ -608,18 +572,18 @@ def ensure_wip_branch(conf: Config) -> None:
 	branch = current_branch()
 	if not branch:
 		die('you are not on a branch')
-	if is_wip_branch(branch=branch):
-		wip_branch = assert_my_wip_branch(conf, branch)
-		logging.debug('currently on WIP branch for (%s)' % (wip_branch.base))
+	if is_wip_branch(branch):
+		logging.debug('currently on WIP branch (%s)' % (branch))
 		return
 	else:
-		my_wip = my_wip_branch(conf=conf, base=assert_base_branch(branch))
+		# TODO support named wips without a base branch
+		my_wip = make_wip_branch(assert_base_branch(branch))
 		logging.debug('checking out %s (from %s)' % (my_wip, branch))
 		git_update_ref(ref_of_branch(my_wip), HEAD_REF)
 		git_checkout_branch(my_wip)
 
+# TODO CHECK merge stuff...
 def update_merge_branch(remote_merge: RemoteWipRef, local_merge: LocalWipRef):
-	assert remote_merge.wip.base == local_merge.wip.base
 	assert remote_merge.wip.is_merge and local_merge.wip.is_merge
 	if is_ancestor(local_merge.ref, remote_merge.ref):
 		git_update_ref(local_merge.ref, remote_merge.ref)
@@ -628,10 +592,10 @@ def update_merge_branch(remote_merge: RemoteWipRef, local_merge: LocalWipRef):
 
 def ensure_merge_branch(conf: Config, base: BaseBranch) -> WipBranch:
 	refs = list(wip_refs(conf.explicit_remote()).values())
-	merges = RefFilter.merges(RefFilter.for_base(base, refs))
+	merges = RefFilter.merges(refs)
 	local_merge = first(RefFilter.local(merges))
 	remote_merge = first(RefFilter.remote(merges))
-	merge_branch = merge_wip_branch(base)
+	merge_branch = merge_wip_branch()
 
 	def write_merge_branch(commit: Commitish) -> None:
 		git_update_ref(ref_of_branch(merge_branch), commit)
@@ -672,55 +636,50 @@ def pull_changes(remote: Remote) -> None:
 def get_pushable_refs(conf: Config) -> List[PushSpec]:
 	refs = list(wip_refs(conf.explicit_remote()).values())
 	result = []
-	my_refs = RefFilter.mine(conf, refs)
-	my_local_refs = RefFilter.local(my_refs)
-	my_remote_refs = RefFilter.remote(my_refs)
+	local_refs = RefFilter.local(refs)
+	remote_refs = RefFilter.remote(refs)
 	merge_refs = RefFilter.merges(refs)
-	local_merge_refs = RefFilter.local(merge_refs)
-	remote_merge_refs = RefFilter.remote(merge_refs)
+	local_merge_ref = first(RefFilter.local(merge_refs))
+	remote_merge_ref = first(RefFilter.remote(merge_refs))
 
-	for local in my_local_refs:
+	for local in local_refs:
 		branch = local.wip.branch
-		remote_ref = first(RefFilter.for_base(local.wip.base, my_remote_refs))
-		if remote_ref is None:
-			result.append(PushSpec.track(branch))
-			logging.debug("remote branch %s will be created at %s" % (
-				branch, local.sha))
-		elif remote_ref.sha != local.sha:
-			force = not is_ancestor(remote_ref.sha, local.sha)
-			logging.debug("remote branch %s (at %s) will be %s to %s" % (
-				branch, remote_ref.sha, 'force pushed' if force else 'fast forwarded', local.sha))
-			result.append(PushSpec.track(branch, force=force))
-		else:
-			logging.debug("remote branch %s is up to date")
+		for remote in conf.remotes():
+			remote_ref = RefFilter.for_remote(remote, local.wip, remote_refs)
+			if remote_ref is None:
+				result.append(PushSpec.track(branch))
+				logging.debug("remote branch %s will be created at %s" % (
+					branch, local.sha))
+			elif remote_ref.sha != local.sha:
+				logging.debug("pushing to remote branch %s (%s -> %s)" % (
+					branch, remote_ref.sha, local.sha))
+				result.append(PushSpec.track(branch))
+			else:
+				logging.debug("remote branch %s is up to date")
 	
-	for remote_ref in my_remote_refs:
-		if first(RefFilter.for_base(remote_ref.wip.base, my_local_refs)) is None:
-			remote = remote_ref.remote
-			branch = remote_ref.wip.branch
-			logging.debug('removing remote branch %s %s' % (remote, branch))
-			result.append(PushSpec.delete(remote, branch))
-
-	for local_merge in local_merge_refs:
-		branch = local_merge.wip.branch
-		remote_merge = first(RefFilter.for_base(local_merge.wip.base, remote_merge_refs))
-		if remote_merge is None:
+	# TODO check merge functionality
+	if local_merge_ref:
+		branch = local_merge_ref.wip.branch
+		if remote_merge_ref is None:
 			result.append(PushSpec.track(branch))
 		else:
-			if local_merge.sha == remote_merge.sha:
-				logging.debug('remote branch %s is up to date (%s)' % (branch, remote_merge.sha))
+			if local_merge_ref.sha == remote_merge_ref.sha:
+				logging.debug('remote branch %s is up to date (%s)' % (branch, remote_merge_ref.sha))
 			else:
 				logging.debug('pushing update to %s (%s -> %s)' % (
 					branch,
-					remote_merge.sha,
-					local_merge.sha
+					remote_merge_ref.sha,
+					local_merge_ref.sha
 				))
-				result.append(PushSpec.track(branch, force=True))
+				result.append(PushSpec.track(branch))
 
 	return result
 
 def garbage_collect(conf: Config) -> None:
-	# delete wips for deleted branches
+	# Can we delete unused wip branches? How do we know if they're
+	# deleted or not-yet-fetched? If they're merged into <base>?
+	# What if they have a symbolic name, not a base branch? Could delete
+	# them if they're merged into any non-wip branch?
 	# TODO ...
 	pass
 
@@ -731,19 +690,16 @@ def push_refs(remote: Remote, specs: List[PushSpec]) -> None:
 	else:
 		logging.info("Pushing refs to %s" % (remote,))
 
-	def do_push(specs: Iterable[PushSpec], force: bool):
+	def do_push(specs: Iterable[PushSpec]):
 		my_specs : List[str] = list(filter(None, [spec.spec(remote) for spec in specs]))
 		if not specs:
 			return
 		cmd = ['git', 'push']
-		if force:
-			cmd.append('-f')
 		cmd.append(remote)
 		cmd.extend(my_specs)
 		run(cmd, lvl=logging.INFO)
 
-	do_push(filter(lambda spec: spec.force, specs), force=True)
-	do_push(filter(lambda spec: not spec.force, specs), force=False)
+	do_push(specs)
 
 ## Utils:
 
@@ -772,12 +728,7 @@ def branch_status(conf: Config):
 	if branch:
 		if is_wip_branch(branch):
 			wip = Wip.parse(assert_wip_branch(branch))
-			if is_my_wip_branch(conf, branch):
-				status('WIP branch: %s' % (wip.branch))
-			elif wip.owner:
-				status('WIP branch belonging to: %s' % (wip.owner))
-			else:
-				status('%s WIP branch: %s' % (wip.id, wip.branch))
+			status('WIP branch: %s' % (branch,))
 		else:
 			status('branch: %s' % (branch,))
 	else:
@@ -793,15 +744,16 @@ def status_action(conf: Config):
 			return branch or ref.ref
 
 		pushable_refs = get_pushable_refs(conf)
-		local_wips = RefFilter.local(RefFilter.mine(conf, refs))
-		remote_wips = RefFilter.remote(RefFilter.for_other_machines(conf, refs))
+		local_wips = RefFilter.local(refs)
+		remote_wips = RefFilter.remote(refs)
 		if remote_wips:
 			print('Remote WIP branches:')
 			for remote_wip in sorted(remote_wips, key=wip_name):
-				print(' - %s/%s (%s)' % (remote_wip.remote, remote_wip.wip.base, remote_wip.wip.id))
+				print(' - %s/%s' % (remote_wip.remote, remote_wip.wip.base))
 		if local_wips:
-			print('Local WIP branches for `%s`: (%d to push)' % (conf.id, len(pushable_refs,)))
+			print('Local WIP branches: (%d to push)' % (len(pushable_refs),))
 			for local_wip in sorted(local_wips, key=wip_name):
+				# TODO
 				requires_push = any([spec.src == local_wip.wip.branch for spec in pushable_refs])
 				suffix = ' (*)' if requires_push else ''
 				print(' - %s%s' % (local_wip.wip.base, suffix))
@@ -823,7 +775,7 @@ def fetch_action(conf: Config):
 
 	# update all tracked merge branches
 	for remote_merge in remote_merge_refs:
-		local_merge = first(RefFilter.local(RefFilter.for_base(remote_merge.wip.base, local_merge_refs)))
+		local_merge = first(RefFilter.local(local_merge_refs))
 		if local_merge is not None:
 			update_merge_branch(remote_merge, local_merge)
 
@@ -839,13 +791,13 @@ def _update_action(conf: Config, show=False):
 	current_checkout = CurrentCheckout()
 
 	def update_branch(base: BaseBranch):
-		remote_refs = RefFilter.remote(RefFilter.for_base(base, RefFilter.for_other_machines(conf, refs)))
+		remote_refs = RefFilter.remote(RefFilter.for_base(base, refs))
 		if not remote_refs:
 			logging.info('no remote WIP branches for %s found' % (base))
 			return
 
-		my_wip = Wip.mine(conf, base)
-		merge_branch = merge_wip_branch(base)
+		my_wip = Wip(base)
+		merge_branch = merge_wip_branch()
 		current_checkout.move(my_wip.branch)
 		def is_unmerged(remote: RemoteWipRef) -> bool:
 			if is_ancestor(remote.sha, my_wip.branch):
@@ -875,14 +827,13 @@ def _update_action(conf: Config, show=False):
 			update_branch(assert_base_branch(Branch(conf.opts.branch)))
 		else:
 			logging.info('Updating all branches with a local wip...')
-			my_refs = RefFilter.mine(conf, refs)
-			my_local_refs = RefFilter.local(my_refs)
+			my_local_refs = RefFilter.local(refs)
 			# update all branches with a local wip
 			for wipref in my_local_refs:
 				update_branch(wipref.wip.base)
 
-def delete_wip_branch_for(conf: Config, base: BaseBranch):
-	wip = Wip.mine(conf, base)
+def delete_wip_branch_for(base: BaseBranch):
+	wip = Wip(base)
 	wip_branch = wip.branch
 	branch_head = sha_of_commitish(wip_branch)
 	if current_branch() == wip_branch:
@@ -894,7 +845,7 @@ def delete_wip_branch_for(conf: Config, base: BaseBranch):
 
 def delete_action(conf: Config):
 	base_branch = require_base_branch(conf.opts)
-	delete_wip_branch_for(conf, base_branch)
+	delete_wip_branch_for(base_branch)
 
 def get_base_branch(opts) -> Optional[BaseBranch]:
 	if opts.branch:
@@ -947,7 +898,7 @@ def show_action(conf: Config):
 	base: BaseBranch = require_base_branch(conf.opts)
 	refs = RefFilter.non_merges(RefFilter.for_base(base, list(wip_refs(conf.explicit_remote()).values())))
 	local_refs = RefFilter.local(refs)
-	remote_refs = RefFilter.remote(RefFilter.for_other_machines(conf, refs))
+	remote_refs = RefFilter.remote(refs)
 
 	def ref_of_wip_ref(ref: WipRef) -> str:
 		return ref.ref
@@ -983,7 +934,7 @@ def merge_action(conf: Config):
 		# OK, merge succeeded. update wip/<branch>/MERGE to mark when these WIP commits were merged
 		merge_commit = Sha(run_output(['git', 'commit-tree', EMPTY_TREE, '-m', 'merge'], dry='MERGE_SHA'))
 		git_update_ref(ref_of_branch(merge_branch), merge_commit)
-	delete_wip_branch_for(conf, base)
+	delete_wip_branch_for(base)
 
 def perform_interactive_rebase(filename: str):
 	commits = []
