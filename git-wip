@@ -94,7 +94,11 @@ class Wip(object):
 		return make_wip_branch(self.base)
 
 	@property
-	def is_merge(self) -> bool: return self.base == MERGE
+	def is_merge(self) -> bool:
+		logging.debug('is_merge(%r) == %r, base = %r and MERGE = %r'
+				% (self, self.base == MERGE, self.base, MERGE))
+
+		return self.base == MERGE
 
 	@property
 	def is_head(self) -> bool: return self.base == HEAD
@@ -344,18 +348,18 @@ class Config(object):
 			if len(kv) == 0: continue
 			key, value = kv.decode('utf-8').split('\n', 1)
 			if key.startswith(CONFIG_PREFIX):
-				key = key.split('.')
-				key.pop(0)
-				key_leaf = key.pop()
-				key_scope = Branch('.'.join(key)) if key else None
-				key = GitConfig.key(key_leaf, scope=key_scope)
+				key_parts = key.split('.')
+				key_parts.pop(0)
+				key_leaf = key_parts.pop()
+				key_scope = Branch('.'.join(key_parts)) if key_parts else None
+				conf_key = GitConfig.key(key_leaf, scope=key_scope)
 
 				# insert all values as lists
 				try:
-					dest = git_conf[key]
+					dest = git_conf[conf_key]
 				except KeyError:
 					dest = []
-					git_conf[key] = dest
+					git_conf[conf_key] = dest
 				dest.append(value)
 
 		logging.debug('Loaded git config: %r' % git_conf,)
@@ -373,6 +377,13 @@ def run(cmd, dry=None, lvl=logging.DEBUG) -> None:
 		return None
 	else:
 		subprocess.check_call(cmd)
+
+def run_popen(cmd, dry=None, lvl=logging.DEBUG, **k) -> subprocess.Popen:
+	log_cmd(cmd, lvl=lvl)
+	if DRY_RUN and dry is not RUN_ANYWAY:
+		return subprocess.Popen(['echo', '1'])
+	else:
+		return subprocess.Popen(cmd)
 
 def run_output(cmd, dry, lvl=logging.DEBUG) -> str:
 	log_cmd(cmd, lvl=lvl)
@@ -648,15 +659,15 @@ def pull_changes(remote: Remote) -> None:
 def get_pushable_refs(conf: Config) -> List[PushSpec]:
 	refs = list(wip_refs(conf.explicit_remote()).values())
 	result = []
-	local_refs = RefFilter.local(refs)
-	remote_refs = RefFilter.remote(refs)
+	non_merge_refs = RefFilter.non_merges(refs)
 	merge_refs = RefFilter.merges(refs)
+	local_refs = RefFilter.local(non_merge_refs)
+	remote_refs = RefFilter.remote(non_merge_refs)
 	local_merge_ref = first(RefFilter.local(merge_refs))
 	remote_merge_ref = first(RefFilter.remote(merge_refs))
 
 	for local in local_refs:
 		branch = local.wip.branch
-		if local.wip.is_merge: continue
 		for remote in conf.remotes():
 			remote_ref = RefFilter.for_remote(remote, local.wip, remote_refs)
 			if remote_ref is None:
@@ -690,15 +701,61 @@ def get_pushable_refs(conf: Config) -> List[PushSpec]:
 	logging.debug("get_pushable_refs() -> %r" % (result))
 	return result
 
-
-def garbage_collect(conf: Config) -> None:
-	# Can we delete unused wip branches? How do we know if they're
-	# deleted or not-yet-fetched? If they're merged into <base>?
-	# What if they have a symbolic name, not a base branch? Could delete
+def gc_action(conf: Config) -> None:
+	# What if WIPs have a symbolic name, not a base branch? Could delete
 	# them if they're merged into any non-wip branch?
-	# TODO ...
-	# git log --format=format:'%s' -2 wip/MERGE
-	pass
+
+	# collect the commits for each wip branch which are ahead of the base
+	wip_subhistories = {}
+	merge_branch = merge_wip_branch()
+	merge_ref = ref_of_branch(merge_branch)
+	if try_run(['git', 'show-ref', '--verify', '--quiet', merge_ref], dry=RUN_ANYWAY):
+		local_refs = RefFilter.non_merges(RefFilter.local(wip_refs(conf.explicit_remote()).values()))
+		for wip_ref in local_refs:
+			subhistory = run_output(['git', 'rev-list', wip_ref.ref, "^"+wip_ref.wip.base], dry=RUN_ANYWAY).splitlines()
+			logging.debug('wip %s has subhistory %r', wip_ref, subhistory)
+			if subhistory:
+				wip_subhistories[wip_ref.wip] = subhistory
+
+	if not wip_subhistories:
+		logging.debug('nothing to clean up')
+		return
+
+	logging.info('Checking wip branches: %s' % (', '.join([wip.branch for wip in wip_subhistories.keys()])))
+	proc = run_popen(['git', 'log', '--format=format:%s', '--full-history', '--topo-order', merge_wip_branch()], stdout=subprocess.PIPE, dry=RUN_ANYWAY)
+
+	for line in proc.stdout:
+		try:
+			merge_json = json.loads(line)
+		except json.JSONDecodeError as e:
+			logging.debug('Skipping non-JSON merge message: %r', line)
+			continue
+		logging.debug('loaded JSON merge message: %r', merge_json)
+		commit = merge_json['commit']
+		merge = merge_json['commit']
+
+		found = []
+
+		for wip, subhistory in wip_subhistories.items():
+			if commit in subhistory:
+				found.append(wip)
+				if commit == subhistory[0]:
+					logging.info('deleting fully-merged branch %s', wip.branch)
+					run(['git', 'branch', '-D', wip.branch])
+				else:
+					logging.warn('branch %s is partially merged, cannot remove it', wip.branch)
+
+		for wip in found:
+			del wip_subhistories[wip]
+
+		if not wip_subhistories:
+			logging.debug('all branches checked')
+			break
+
+	if proc.poll() == None:
+		proc.kill()
+	else:
+		assert proc.returncode == 0
 
 def push_refs(remote: Remote, specs: List[PushSpec]) -> None:
 	if not specs:
@@ -805,6 +862,8 @@ def fetch_action(conf: Config):
 			update_merge_branch(remote_merge=remote_merge, local_merge=local_merge)
 
 def _update_action(conf: Config, show=False):
+	if has_changes():
+		die("You have uncommitted changes")
 	refs = list(wip_refs(conf.explicit_remote()).values())
 	current_checkout = CurrentCheckout()
 
@@ -845,13 +904,10 @@ def _update_action(conf: Config, show=False):
 			update_branch(assert_base_branch(Branch(conf.opts.branch)))
 		else:
 			logging.info('Updating all branches with a local wip...')
-			my_local_refs = RefFilter.local(refs)
+			my_local_refs = RefFilter.local(RefFilter.non_merges(refs))
 			# update all branches with a local wip
 			for wipref in my_local_refs:
 				update_branch(wipref.wip.base)
-
-def gc_action(conf: Config):
-	raise AssertionError("TODO")
 
 def delete_wip_branch_for(base: BaseBranch):
 	wip = Wip(base)
@@ -894,12 +950,17 @@ def checkout_action(conf: Config):
 	git_checkout_branch(base)
 	ensure_wip_branch(conf)
 
-def sync_action(conf: Config):
-	fetch_action(conf)
+def update_action(conf: Config):
 	if has_changes():
 		save_action(conf)
-	if conf.opts.update is not False:
-		_update_action(conf)
+	_update_action(conf)
+
+def pull_action(conf: Config):
+	fetch_action(conf)
+	update_action(conf)
+
+def sync_action(conf: Config):
+	pull_action(conf)
 	push_action(conf)
 
 def push_action(conf: Config):
@@ -967,7 +1028,7 @@ def merge_action(conf: Config):
 def perform_interactive_rebase(filename: str):
 	commits = []
 	with open(filename) as f:
-		for lines in f:
+		for line in f:
 			line = line.strip()
 			if line.startswith('#'):
 				logging.debug('dropping line: %s' % (line,))
@@ -999,16 +1060,21 @@ def main() -> None:
 		'',
 		'Actions:',
 		' status:   default, show WIP details',
-		' fetch:    fetch WIPs from remote',
-		' push:     push WIPs to remote',
-		' save:     commit changes as WIP',
-		' merge:    commit WIP to mainline branch (as a squashed commit)',
-		' sync:     fetch, save & push',
-
-		' checkout: move to a WIP branch',
-		' rm:       remove a WIP branch',
-		' diff:     show differences on WIP branch',
 		' show:     show WIP branches (using git show-branch)',
+		' diff:     show differences on WIP branch',
+		'',
+		' checkout: move to a WIP branch',
+		' save:     commit changes as WIP',
+		' push:     push WIPs to remote',
+		'',
+		' fetch:    fetch WIPs from remote',
+		' update:   merge corresponding remote branches into local WIP branches',
+		' pull:     fetch & update',
+		' sync:     pull & push',
+		'',
+		' merge:    commit WIP to mainline branch (as a squashed commit)',
+		' gc:       remove fully merged WIP branches',
+		' rm:       remove a WIP branch',
 	])
 	p = optparse.OptionParser(usage=usage)
 	p.add_option('-v', '--verbose', action='store_true')
@@ -1043,11 +1109,14 @@ def main() -> None:
 		'show': show_action,
 		'checkout': checkout_action,
 		'co': checkout_action,
+		'gc': gc_action,
 		'rm': delete_action,
 		'fetch': fetch_action,
 		'save': save_action,
 		'sync': sync_action,
 		'push': push_action,
+		'pull': pull_action,
+		'update': update_action,
 		'diff': diff_action,
 		'merge': merge_action,
 		'help': help_action,
