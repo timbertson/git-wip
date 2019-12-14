@@ -991,7 +991,7 @@ def show_action(conf: Config):
 	)
 	run(['git', 'show-branch'] + branches)
 
-def merge_action(conf: Config):
+def merge_action(conf: Config, mark_without_merging=False):
 	if has_changes():
 		die('you have uncommitted changes')
 	optional_ref: Optional[Ref] = current_ref()
@@ -1000,22 +1000,16 @@ def merge_action(conf: Config):
 		die('not on a branch')
 	ref: Ref = assert_some(optional_ref)
 	branch: Branch = assert_some(optional_branch)
-
-	base: BaseBranch = base_branch_of_wip_branch(assert_wip_branch(branch))
-
-	refs: Dict[Ref,WipRef] = wip_refs(conf.explicit_remote())
-	wip_ref: WipRef = refs[ref]
+	wip_branch = assert_wip_branch(branch)
+	base: BaseBranch = base_branch_of_wip_branch(wip_branch)
+	wip_ref: WipRef = LocalWipRef(ref=ref, wip=Wip.parse(wip_branch), sha=sha_of_commitish(ref))
 	logging.info("merging branch %s (%s) into %s" % (branch, wip_ref.sha, base,))
 	merge_branch = ensure_merge_branch(conf, base)
 	merge_sha = sha_of_commitish(merge_branch)
 
-	current_checkout = CurrentCheckout()
-	with current_checkout.restoring():
-		current_checkout.move(base)
-		git_merge(['--squash', ref])
-		run(['git', 'commit', '-v', '--edit', '-m', 'merge WIP changes'])
-		# OK, merge succeeded. update wip/<branch>/MERGE to mark when these WIP commits were merged
-		head = sha_of_commitish(HEAD_REF)
+	def mark_merged(ref):
+		# update wip/<branch>/MERGE to mark when these WIP commits were merged
+		head = sha_of_commitish(ref)
 		data = {
 			'commit': wip_ref.sha,
 			'merge': head,
@@ -1023,7 +1017,21 @@ def merge_action(conf: Config):
 		merge_message = json.dumps(data)
 		merge_commit = Sha(run_output(['git', 'commit-tree', EMPTY_TREE, '-p', merge_sha, '-m', merge_message], dry='MERGE_SHA'))
 		git_update_ref(ref_of_branch(merge_branch), merge_commit)
+
+	if mark_without_merging:
+		mark_merged(HEAD_REF)
+	else:
+		current_checkout = CurrentCheckout()
+		with current_checkout.restoring():
+			current_checkout.move(base)
+			git_merge(['--squash', ref])
+			run(['git', 'commit', '-v', '--edit', '-m', 'merge WIP changes'])
+			mark_merged(HEAD_REF)
+
 	delete_wip_branch_for(base)
+
+def mark_merged_action(conf: Config):
+	merge_action(conf, mark_without_merging=True)
 
 def perform_interactive_rebase(filename: str):
 	commits = []
@@ -1073,6 +1081,7 @@ def main() -> None:
 		' sync:     pull & push',
 		'',
 		' merge:    commit WIP to mainline branch (as a squashed commit)',
+		' mark-merged: mark WIP as merged and discard',
 		' gc:       remove fully merged WIP branches',
 		' rm:       remove a WIP branch',
 	])
@@ -1119,6 +1128,7 @@ def main() -> None:
 		'update': update_action,
 		'diff': diff_action,
 		'merge': merge_action,
+		'mark-merged': mark_merged_action,
 		'help': help_action,
 	}
 
