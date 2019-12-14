@@ -95,9 +95,6 @@ class Wip(object):
 
 	@property
 	def is_merge(self) -> bool:
-		logging.debug('is_merge(%r) == %r, base = %r and MERGE = %r'
-				% (self, self.base == MERGE, self.base, MERGE))
-
 		return self.base == MERGE
 
 	@property
@@ -706,23 +703,18 @@ def gc_action(conf: Config) -> None:
 	# them if they're merged into any non-wip branch?
 
 	# collect the commits for each wip branch which are ahead of the base
-	wip_subhistories = {}
 	merge_branch = merge_wip_branch()
-	merge_ref = ref_of_branch(merge_branch)
-	if try_run(['git', 'show-ref', '--verify', '--quiet', merge_ref], dry=RUN_ANYWAY):
-		local_refs = RefFilter.non_merges(RefFilter.local(wip_refs(conf.explicit_remote()).values()))
-		for wip_ref in local_refs:
-			subhistory = run_output(['git', 'rev-list', wip_ref.ref, "^"+wip_ref.wip.base], dry=RUN_ANYWAY).splitlines()
-			logging.debug('wip %s has subhistory %r', wip_ref, subhistory)
-			if subhistory:
-				wip_subhistories[wip_ref.wip] = subhistory
-
-	if not wip_subhistories:
-		logging.debug('nothing to clean up')
+	if not try_run(['git', 'show-ref', '--verify', '--quiet', ref_of_branch(merge_branch)], dry=RUN_ANYWAY):
+		logging.info('No local MERGE branch, skipping')
 		return
 
-	logging.info('Checking wip branches: %s' % (', '.join([wip.branch for wip in wip_subhistories.keys()])))
-	proc = run_popen(['git', 'log', '--format=format:%s', '--full-history', '--topo-order', merge_wip_branch()], stdout=subprocess.PIPE, dry=RUN_ANYWAY)
+	local_wip_refs = list(RefFilter.local(RefFilter.non_merges(wip_refs(conf.explicit_remote()).values())))
+	if not local_wip_refs:
+		logging.info('No local WIP branches, skipping')
+		return
+
+	logging.info('Checking wip branches: %s' % (', '.join([wip.wip.branch for wip in local_wip_refs])))
+	proc = run_popen(['git', 'log', '--format=format:%s', '--full-history', '--topo-order', merge_branch], stdout=subprocess.PIPE, dry=RUN_ANYWAY)
 
 	for line in proc.stdout:
 		try:
@@ -731,24 +723,21 @@ def gc_action(conf: Config) -> None:
 			logging.debug('Skipping non-JSON merge message: %r', line)
 			continue
 		logging.debug('loaded JSON merge message: %r', merge_json)
-		commit = merge_json['commit']
-		merge = merge_json['commit']
+		commit = Sha(merge_json['commit'])
+		merge = Sha(merge_json['commit'])
 
 		found = []
 
-		for wip, subhistory in wip_subhistories.items():
-			if commit in subhistory:
-				found.append(wip)
-				if commit == subhistory[0]:
-					logging.info('deleting fully-merged branch %s', wip.branch)
-					run(['git', 'branch', '-D', wip.branch])
-				else:
-					logging.warn('branch %s is partially merged, cannot remove it', wip.branch)
+		for wip_ref in local_wip_refs:
+			if commit == wip_ref.sha:
+				logging.info('deleting fully-merged branch %s', wip_ref.wip.branch)
+				run(['git', 'branch', '-D', wip_ref.wip.branch])
+				found.append(wip_ref)
 
-		for wip in found:
-			del wip_subhistories[wip]
+		for wip_ref in found:
+			local_wip_refs.remove(wip_ref)
 
-		if not wip_subhistories:
+		if not local_wip_refs:
 			logging.debug('all branches checked')
 			break
 
