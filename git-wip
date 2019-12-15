@@ -380,7 +380,7 @@ def run_popen(cmd, dry=None, lvl=logging.DEBUG, **k) -> subprocess.Popen:
 	if DRY_RUN and dry is not RUN_ANYWAY:
 		return subprocess.Popen(['echo', '1'])
 	else:
-		return subprocess.Popen(cmd)
+		return subprocess.Popen(cmd, **k)
 
 def run_output(cmd, dry, lvl=logging.DEBUG) -> str:
 	log_cmd(cmd, lvl=lvl)
@@ -613,7 +613,7 @@ def update_merge_branch(remote_merge: RemoteWipRef, local_merge: LocalWipRef):
 		write_merge_branch(empty_commit)
 		assert(is_ancestor(remote_merge.ref, local_merge.ref))
 
-def ensure_merge_branch(conf: Config, base: BaseBranch) -> WipBranch:
+def ensure_merge_branch(conf: Config) -> WipBranch:
 	refs = list(wip_refs(conf.explicit_remote()).values())
 	merges = RefFilter.merges(refs)
 	local_merge = first(RefFilter.local(merges))
@@ -863,7 +863,7 @@ def _update_action(conf: Config, show=False):
 			return
 
 		my_wip = Wip(base)
-		merge_branch = merge_wip_branch()
+		merge_branch = ensure_merge_branch(conf)
 		current_checkout.move(my_wip.branch)
 		def is_unmerged(remote: RemoteWipRef) -> bool:
 			if is_ancestor(remote.sha, my_wip.branch):
@@ -993,7 +993,7 @@ def merge_action(conf: Config, mark_without_merging=False):
 	base: BaseBranch = base_branch_of_wip_branch(wip_branch)
 	wip_ref: WipRef = LocalWipRef(ref=ref, wip=Wip.parse(wip_branch), sha=sha_of_commitish(ref))
 	logging.info("merging branch %s (%s) into %s" % (branch, wip_ref.sha, base,))
-	merge_branch = ensure_merge_branch(conf, base)
+	merge_branch = ensure_merge_branch(conf)
 	merge_sha = sha_of_commitish(merge_branch)
 
 	def mark_merged(ref):
