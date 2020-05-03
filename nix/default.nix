@@ -1,8 +1,8 @@
-{ pkgs ? import <nixpkgs> {}, srcOverrides ? {}}:
+{ pkgs ? import <nixpkgs> {} }:
 with pkgs;
 stdenv.mkDerivation rec {
 	name = "git-wip";
-	src = srcOverrides.git-wip or ./..;
+	src = ./..;
 	buildInputs = [ python3 ];
 	installPhase = ''
 		mkdir -p $out/bin
